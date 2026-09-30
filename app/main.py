@@ -13,9 +13,15 @@ from fastapi.responses import JSONResponse
 
 from . import database
 from .planner import PlanningError
-from .schemas import ClockIn, ClosureIn, GroupIn, ScenarioIn
+from .schemas import (
+    ClockIn,
+    ClosureIn,
+    ConfirmIn,
+    GroupIn,
+    ScenarioIn,
+)
 from .seed import seed_scenario
-from .service import EvacuationService, RequestError
+from .service import CredentialError, EvacuationService, RequestError
 
 DB_PATH = os.environ.get("EVAC_DB_PATH", "/data/evacuation.db")
 MAX_PATHS = int(os.environ.get("EVAC_MAX_PATHS", "10000"))
@@ -54,6 +60,12 @@ async def _planning_error_handler(_: Request, exc: PlanningError) -> JSONRespons
     return JSONResponse(status_code=409, content={"error": "planning_conflict", "detail": str(exc)})
 
 
+@app.exception_handler(CredentialError)
+async def _credential_error_handler(_: Request, exc: CredentialError) -> JSONResponse:
+    return JSONResponse(status_code=409,
+                        content={"error": "credential_invalid", "detail": str(exc)})
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -84,6 +96,23 @@ def delete_group(group_id: int, request: Request) -> dict:
 def add_closures(payload: Union[ClosureIn, list[ClosureIn]], request: Request) -> dict:
     items = payload if isinstance(payload, list) else [payload]
     return request.app.state.service.add_closures(items)
+
+
+@app.post("/api/closures/preview",
+          summary="预演一批封闭时段对疏散计划的影响（不写入状态，返回可确认凭据）")
+def preview_closures(payload: Union[ClosureIn, list[ClosureIn]], request: Request) -> dict:
+    items = payload if isinstance(payload, list) else [payload]
+    return request.app.state.service.preview_closures(items)
+
+
+@app.post("/api/closures/confirm",
+          summary="凭预演凭据在同一原子操作内核验内容与版本，重算并提交封闭")
+def confirm_closures(payload: ConfirmIn, request: Request) -> dict:
+    closures = payload.closures
+    items = None if closures is None else (
+        closures if isinstance(closures, list) else [closures]
+    )
+    return request.app.state.service.confirm_closures(payload.token, items)
 
 
 @app.delete("/api/closures/{closure_id}", summary="删除封闭时段并重排未出发组")

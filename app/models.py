@@ -50,3 +50,6 @@ class State:
     closures: dict[int, Closure]
     groups: dict[int, Group]
     now: int = 0
+    # 状态版本号：任何已提交变更（组/封闭增删、场景替换/重置、时钟推进）后单调递增；
+    # 预演凭据绑定生成时的版本，确认时版本不一致即拒绝。
+    version: int = 0

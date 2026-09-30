@@ -44,5 +44,37 @@ curl -sS -X POST "$BASE/api/groups" \
 echo "== 7. 删除未出发组 =="
 curl -sS -X DELETE "$BASE/api/groups/2" | python3 -m json.tool
 
-echo "== 8. 恢复内置演示场景 =="
+echo "== 8. 封闭预演（不写入状态；返回凭据 token、拟执行编排 plan、逐组变化 changes）=="
+echo "    通道2 封闭 [4,8) 会把未出发的组7 由“通道2 第1分出发”挤到通道1 第8分出发"
+PREVIEW=$(curl -sS -X POST "$BASE/api/closures/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"edge_id": 2, "start_minute": 4, "end_minute": 8}')
+echo "$PREVIEW" | python3 -m json.tool
+TOKEN=$(echo "$PREVIEW" | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
+echo "拿到确认凭据：$TOKEN"
+
+echo "== 9. 预演未写入：计划状态版本未变 =="
+curl -sS "$BASE/api/plan" | python3 -c 'import sys,json; print("state_version =", json.load(sys.stdin)["state_version"])'
+
+echo "== 10. 凭凭据确认提交（原子内核验内容与版本并重算）=="
+curl -sS -X POST "$BASE/api/closures/confirm" \
+  -H 'Content-Type: application/json' \
+  -d "{\"token\": \"$TOKEN\", \"closures\": [{\"edge_id\": 2, \"start_minute\": 4, \"end_minute\": 8}]}" \
+  | python3 -m json.tool
+
+echo "== 11. 凭据一次性：重复确认 -> 409 credential_invalid =="
+curl -sS -X POST "$BASE/api/closures/confirm" \
+  -H 'Content-Type: application/json' -d "{\"token\": \"$TOKEN\"}"; echo
+
+echo "== 12. 版本失效：先预演，再推进时钟，确认被拒且不写入 =="
+TOKEN2=$(curl -sS -X POST "$BASE/api/closures/preview" \
+  -H 'Content-Type: application/json' \
+  -d '{"edge_id": 1, "start_minute": 40, "end_minute": 50}' \
+  | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])')
+curl -sS -X POST "$BASE/api/clock/advance" \
+  -H 'Content-Type: application/json' -d '{"minutes": 1}' >/dev/null
+curl -sS -X POST "$BASE/api/closures/confirm" \
+  -H 'Content-Type: application/json' -d "{\"token\": \"$TOKEN2\"}"; echo
+
+echo "== 13. 恢复内置演示场景 =="
 curl -sS -X POST "$BASE/api/reset" >/dev/null && echo "reset ok"

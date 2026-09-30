@@ -1,7 +1,7 @@
 """HTTP 入参校验（Pydantic v2）。所有时间均为整数分钟，封闭时段左闭右开。"""
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Union
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -60,3 +60,13 @@ class ScenarioIn(BaseModel):
 
 class ClockIn(BaseModel):
     minutes: PositiveInt = Field(description="向前推进的分钟数")
+
+
+class ConfirmIn(BaseModel):
+    token: str = Field(min_length=1, description="预演接口返回的确认凭据")
+    # 可选回传拟确认的封闭批次用于内容核对；缺省时仅核对凭据内绑定的内容与版本
+    # 与 POST /api/closures 一致，单个对象或数组均可（路由层归一化为数组）
+    closures: Union[ClosureIn, list[ClosureIn], None] = Field(
+        default=None,
+        description="拟确认的封闭时段，须与预演内容（不含编号）一致",
+    )

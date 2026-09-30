@@ -22,6 +22,9 @@
   则整次变更拒绝（HTTP 409），不写入任何数据。
 - 每次变更在单个 SQLite 事务内完成“全量重排 + 落库”：并发变更不会超用容量，
   也不会留下只重排一部分组的中间状态。
+- 每次成功提交的变更（人群组或封闭增删、场景替换/重置、时钟推进）都会使
+  **状态版本号 `state_version` 单调递增**；封闭预演凭据绑定生成时的版本，
+  确认时在同一事务内核验内容与版本，任一不符即拒绝且不写入。
 - 无法在截止分钟前（到达分钟 `> deadline`）安排的组返回原因码：
   - `no_path_to_exit`：图上不存在到出口的路线；
   - `no_capacity_before_deadline`：容量/封闭限制导致截止前无法安排
@@ -82,6 +85,8 @@ EVAC_DB_PATH=./data/evacuation.db .venv/bin/uvicorn app.main:app --host 0.0.0.0 
 | POST | `/api/groups` | 新增人群组，仅重排未出发组 |
 | DELETE | `/api/groups/{id}` | 删除未出发人群组并重排（已出发组 409） |
 | POST | `/api/closures` | 新增封闭时段；触及已出发组剩余路线则 409 整次拒绝 |
+| POST | `/api/closures/preview` | **预演**一批封闭对计划的影响（不写入），返回确认凭据 |
+| POST | `/api/closures/confirm` | 凭凭据在原子事务内核验内容与版本，重算并提交 |
 | DELETE | `/api/closures/{id}` | 删除封闭时段并重排未出发组 |
 | POST | `/api/clock/advance` | 时钟向前推进 N 分钟 |
 | POST | `/api/reset` | 恢复内置演示场景 |
@@ -104,6 +109,7 @@ EVAC_DB_PATH=./data/evacuation.db .venv/bin/uvicorn app.main:app --host 0.0.0.0 
 ```json
 {
   "now": 0,
+  "state_version": 0,
   "groups": [
     {
       "id": 1,
@@ -132,7 +138,72 @@ EVAC_DB_PATH=./data/evacuation.db .venv/bin/uvicorn app.main:app --host 0.0.0.0 
 
 错误响应：参数结构错误返回 `422`；语义错误（编号重复、引用不存在等）
 返回 `400 {"error":"bad_request",...}`；封闭触及已出发组或删除已出发组等
-结构性冲突返回 `409 {"error":"planning_conflict",...}`。
+结构性冲突返回 `409 {"error":"planning_conflict",...}`；预演凭据不存在/已使用、
+内容或版本不符返回 `409 {"error":"credential_invalid",...}`。
+
+### 封闭预演与凭据确认（值班员流程）
+
+值班员封闭通道前可先**预演**对疏散计划的影响，确认无误后再凭凭据**原子提交**。
+预演完全不写入状态；字段、左闭右开规则、编号分配、冲突检测与重排规则与
+`POST /api/closures` 完全一致（单个对象或数组均可）。
+
+**第一步：预演** `POST /api/closures/preview`
+
+请求体同 `POST /api/closures`。响应：
+
+```json
+{
+  "committed": false,
+  "token": "u3C9w...",
+  "state_version": 7,
+  "now": 4,
+  "closures": [
+    {"id": 3, "edge_id": 1, "start_minute": 10, "end_minute": 20}
+  ],
+  "plan": { "now": 4, "state_version": 7, "groups": [ ... ] },
+  "changes": [
+    {
+      "id": 2,
+      "before": {"status": "scheduled", "route": [1], "departure_minute": 4,
+                 "arrival_minute": 6, "reason": null, "...": "..."},
+      "after":  {"status": "scheduled", "route": [4, 5], "departure_minute": 4,
+                 "arrival_minute": 12, "reason": null, "...": "..."}
+    },
+    {
+      "id": 5,
+      "before": {"status": "scheduled", "...": "..."},
+      "after":  {"status": "blocked", "route": [], "departure_minute": null,
+                 "arrival_minute": null, "reason": "no_capacity_before_deadline"}
+    }
+  ]
+}
+```
+
+- `token`：绑定“该批封闭内容 + 当前 `state_version`”的确认凭据（仅存于服务进程
+  内存，进程重启即失效）；`closures[].id` 为提交时将分配的编号。
+- `plan`：**拟执行后的完整编排**，结构与 `GET /api/plan` 相同。
+- `changes`：**逐组变化**，仅列出受影响组（按编号升序），每项给出 `before`/`after`
+  的出发分钟、路线、到达分钟，或由可安排变为受阻的原因；未变化的组不出现。
+- 封闭与任一**已出发组剩余占用**冲突时返回 `409 planning_conflict`，
+  **不生成凭据**（响应中无 `token`），整批不落库。
+
+**第二步：确认提交** `POST /api/closures/confirm`
+
+```json
+{
+  "token": "u3C9w...",
+  "closures": [ {"edge_id": 1, "start_minute": 10, "end_minute": 20} ]
+}
+```
+
+- `closures` 可选：回传时逐条核对内容（编号不参与，须与预演一致，单对象或数组
+  均可）；缺省时仅核对凭据内绑定的内容。
+- 在**同一原子操作**（互斥锁 + 单 SQLite 事务）内：核对内容与 `state_version`，
+  按现行优先级、容量与固定路线规则重算并提交，返回
+  `{"committed": true, "token": ..., "now": ..., "state_version": ..., "groups": [...]}`。
+- 预演之后只要发生过任何已提交变更——**人群组或封闭增删、场景替换或重置、
+  时钟推进**——版本即不再匹配，确认返回 `409 credential_invalid` 且不写入；
+  凭据**一次性**，确认成功或失败后均不可复用，需重新预演。
 
 ## 四、调用示例
 
@@ -172,7 +243,9 @@ python3 examples/call_api.py http://127.0.0.1:8000
 
 测试覆盖：最短路径与封闭推迟、左闭右开边界、每分钟容量错峰（含跨多分钟通道）、
 优先级/同级排序、出口与通道序列平局裁决、时钟推进后已出发组固定、
-封闭触及剩余路线的冲突检测、批量变更原子性，以及 10 并发新增组不超卖容量。
+封闭触及剩余路线的冲突检测、批量变更原子性，以及 10 并发新增组不超卖容量；
+另覆盖封闭预演不写状态、逐组差异、冲突不发凭据，以及凭据确认在时钟推进、
+组/封闭增删、场景替换/重置后版本失效与并发确认的一次性语义。
 
 ## 七、目录结构
 

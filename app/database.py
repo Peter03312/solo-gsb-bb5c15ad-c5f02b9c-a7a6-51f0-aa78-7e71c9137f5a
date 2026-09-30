@@ -61,6 +61,10 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES ('now', '0')"
     )
+    # 状态版本号（单调递增）；既有旧库无此键时初始为 0
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(key, value) VALUES ('version', '0')"
+    )
     conn.commit()
 
 
@@ -89,7 +93,10 @@ def load_state(conn: sqlite3.Connection) -> State:
         )
     row = conn.execute("SELECT value FROM meta WHERE key='now'").fetchone()
     now = int(row["value"]) if row else 0
-    return State(edges=edges, exits=exits, closures=closures, groups=groups, now=now)
+    row = conn.execute("SELECT value FROM meta WHERE key='version'").fetchone()
+    version = int(row["value"]) if row else 0
+    return State(edges=edges, exits=exits, closures=closures, groups=groups,
+                 now=now, version=version)
 
 
 # ---------------------------------------------------------------- 写入
@@ -124,12 +131,14 @@ def replace_state(
     conn.execute("DELETE FROM sqlite_sequence WHERE name='closures'")
     _upsert_groups(conn, groups)
     set_now(conn, 0)
+    set_version(conn, 0)
 
 
 def add_closures(conn: sqlite3.Connection, closures: list[Closure]) -> None:
     conn.executemany(
-        "INSERT INTO closures(edge_id, start_minute, end_minute) VALUES (?,?,?)",
-        [(c.edge_id, c.start_minute, c.end_minute) for c in closures],
+        "INSERT INTO closures(id, edge_id, start_minute, end_minute) "
+        "VALUES (?,?,?,?)",
+        [(c.id, c.edge_id, c.start_minute, c.end_minute) for c in closures],
     )
 
 
@@ -172,3 +181,18 @@ def set_now(conn: sqlite3.Connection, now: int) -> None:
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (str(now),),
     )
+
+
+def set_version(conn: sqlite3.Connection, version: int) -> None:
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES ('version', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (str(version),),
+    )
+
+
+def bump_version(conn: sqlite3.Connection, current: int) -> int:
+    """版本号单调递增并返回新版本（须已在事务中）。"""
+    new_version = current + 1
+    set_version(conn, new_version)
+    return new_version
