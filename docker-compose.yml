@@ -1,0 +1,18 @@
+services:
+  evacuation:
+    build: .
+    image: evacuation-scheduler:1.0
+    container_name: evacuation-scheduler
+    ports:
+      - "8000:8000"
+    environment:
+      # SQLite 数据文件路径（挂载卷持久化；删除卷即恢复初始演示数据）
+      EVAC_DB_PATH: /data/evacuation.db
+      # 单组编排时枚举简单路径的上限，图很大时可调高
+      EVAC_MAX_PATHS: "10000"
+    volumes:
+      - evac-data:/data
+    restart: unless-stopped
+
+volumes:
+  evac-data:
