@@ -13,9 +13,14 @@ from fastapi.responses import JSONResponse
 
 from . import database
 from .planner import PlanningError
-from .schemas import ClockIn, ClosureIn, GroupIn, ScenarioIn
+from .schemas import ClockIn, ClosureIn, ConfirmIn, GroupIn, ScenarioIn
 from .seed import seed_scenario
-from .service import EvacuationService, RequestError
+from .service import (
+    CredentialInvalid,
+    CredentialNotFound,
+    EvacuationService,
+    RequestError,
+)
 
 DB_PATH = os.environ.get("EVAC_DB_PATH", "/data/evacuation.db")
 MAX_PATHS = int(os.environ.get("EVAC_MAX_PATHS", "10000"))
@@ -38,8 +43,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="场馆疏散通道编排服务",
-    version="1.0.0",
-    description="基于有向通道、容量与封闭时段的分组疏散编排（贪心 + 全量原子重排）",
+    version="1.1.0",
+    description="基于有向通道、容量与封闭时段的分组疏散编排（贪心 + 全量原子重排 + 封闭预演/凭据确认）",
     lifespan=lifespan,
 )
 
@@ -52,6 +57,16 @@ async def _request_error_handler(_: Request, exc: RequestError) -> JSONResponse:
 @app.exception_handler(PlanningError)
 async def _planning_error_handler(_: Request, exc: PlanningError) -> JSONResponse:
     return JSONResponse(status_code=409, content={"error": "planning_conflict", "detail": str(exc)})
+
+
+@app.exception_handler(CredentialNotFound)
+async def _credential_not_found_handler(_: Request, exc: CredentialNotFound) -> JSONResponse:
+    return JSONResponse(status_code=404, content={"error": "credential_not_found", "detail": str(exc)})
+
+
+@app.exception_handler(CredentialInvalid)
+async def _credential_invalid_handler(_: Request, exc: CredentialInvalid) -> JSONResponse:
+    return JSONResponse(status_code=409, content={"error": "credential_invalid", "detail": str(exc)})
 
 
 @app.get("/health")
@@ -84,6 +99,19 @@ def delete_group(group_id: int, request: Request) -> dict:
 def add_closures(payload: Union[ClosureIn, list[ClosureIn]], request: Request) -> dict:
     items = payload if isinstance(payload, list) else [payload]
     return request.app.state.service.add_closures(items)
+
+
+@app.post("/api/closures/preview",
+          summary="预演一批封闭（不写状态）：返回确认凭据、拟执行后编排与逐组变化")
+def preview_closures(payload: Union[ClosureIn, list[ClosureIn]], request: Request) -> dict:
+    items = payload if isinstance(payload, list) else [payload]
+    return request.app.state.service.preview_closures(items)
+
+
+@app.post("/api/closures/confirm",
+          summary="按预演凭据原子提交封闭：核对内容与状态版本后重算并落库")
+def confirm_closures(payload: ConfirmIn, request: Request) -> dict:
+    return request.app.state.service.confirm_closures(payload.token)
 
 
 @app.delete("/api/closures/{closure_id}", summary="删除封闭时段并重排未出发组")

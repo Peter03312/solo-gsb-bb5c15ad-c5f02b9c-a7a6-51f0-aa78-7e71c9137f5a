@@ -50,3 +50,5 @@ class State:
     closures: dict[int, Closure]
     groups: dict[int, Group]
     now: int = 0
+    # 状态版本：每次已提交的变更 +1；预演凭据绑定该版本，任何变更后失效
+    version: int = 0

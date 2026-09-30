@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import os
 import sqlite3
-import threading
 
 from .models import Closure, Edge, Exit, Group, State
 
@@ -61,6 +60,11 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.execute(
         "INSERT OR IGNORE INTO meta(key, value) VALUES ('now', '0')"
     )
+    # 状态版本：每次已提交的变更（组/封闭增删、场景替换/重置、时钟推进）+1，
+    # 用于使预演凭据失效
+    conn.execute(
+        "INSERT OR IGNORE INTO meta(key, value) VALUES ('state_version', '0')"
+    )
     conn.commit()
 
 
@@ -89,7 +93,12 @@ def load_state(conn: sqlite3.Connection) -> State:
         )
     row = conn.execute("SELECT value FROM meta WHERE key='now'").fetchone()
     now = int(row["value"]) if row else 0
-    return State(edges=edges, exits=exits, closures=closures, groups=groups, now=now)
+    vrow = conn.execute(
+        "SELECT value FROM meta WHERE key='state_version'"
+    ).fetchone()
+    version = int(vrow["value"]) if vrow else 0
+    return State(edges=edges, exits=exits, closures=closures, groups=groups,
+                 now=now, version=version)
 
 
 # ---------------------------------------------------------------- 写入
@@ -127,10 +136,19 @@ def replace_state(
 
 
 def add_closures(conn: sqlite3.Connection, closures: list[Closure]) -> None:
+    # 显式写入编号：预演凭据中预分配的编号与落库结果必须一致
     conn.executemany(
-        "INSERT INTO closures(edge_id, start_minute, end_minute) VALUES (?,?,?)",
-        [(c.edge_id, c.start_minute, c.end_minute) for c in closures],
+        "INSERT INTO closures(id, edge_id, start_minute, end_minute) "
+        "VALUES (?,?,?,?)",
+        [(c.id, c.edge_id, c.start_minute, c.end_minute) for c in closures],
     )
+    cur = conn.execute("SELECT MAX(id) FROM closures")
+    max_id = cur.fetchone()[0]
+    if max_id is not None:
+        conn.execute(
+            "INSERT OR REPLACE INTO sqlite_sequence(name, seq) VALUES ('closures', ?)",
+            (max_id,),
+        )
 
 
 def delete_closure(conn: sqlite3.Connection, closure_id: int) -> bool:
@@ -172,3 +190,17 @@ def set_now(conn: sqlite3.Connection, now: int) -> None:
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (str(now),),
     )
+
+
+def bump_state_version(conn: sqlite3.Connection) -> int:
+    """状态版本 +1 并返回新版本（须在事务中调用）。
+
+    任何已提交的变更（组/封闭增删、场景替换/重置、时钟推进）都推进版本，
+    从而使绑定旧版本的预演凭据全部失效。
+    """
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES ('state_version', '1') "
+        "ON CONFLICT(key) DO UPDATE SET value = value + 1"
+    )
+    row = conn.execute("SELECT value FROM meta WHERE key='state_version'").fetchone()
+    return int(row["value"])

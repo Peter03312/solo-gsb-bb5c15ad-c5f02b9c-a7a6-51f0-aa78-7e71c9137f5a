@@ -60,3 +60,7 @@ class ScenarioIn(BaseModel):
 
 class ClockIn(BaseModel):
     minutes: PositiveInt = Field(description="向前推进的分钟数")
+
+
+class ConfirmIn(BaseModel):
+    token: str = Field(min_length=1, description="预演接口返回的确认凭据")

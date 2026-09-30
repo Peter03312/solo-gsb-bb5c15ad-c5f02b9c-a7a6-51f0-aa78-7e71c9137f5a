@@ -3,7 +3,8 @@
 基于 **Python 3.11 + FastAPI + SQLite** 的疏散通道编排 HTTP 服务。输入有向通道
 （通行分钟数、每分钟容量、左闭右开封闭时段）、出口位置与人群组（人数、起点、
 最早出发分钟、优先级、规划截止分钟），服务按规则逐组编排路线与出发时间，并在
-时间推进、新增组/封闭时对未出发组进行原子重排。
+时间推进、新增组/封闭时对未出发组进行原子重排；封闭通道前支持**预演影响并凭
+确认凭据原子提交**。
 
 ## 一、编排规则
 
@@ -20,6 +21,10 @@
   新增人群组或封闭时段时只重排未出发组。
 - 新增封闭若与任一已出发组的**剩余路线**（`now` 之后仍占用的分钟）相交，
   则整次变更拒绝（HTTP 409），不写入任何数据。
+- **封闭可先预演**（`POST /api/closures/preview`）：只读重排，发放绑定“封闭批次
+  内容 + 状态版本”的确认凭据；凭据确认（`POST /api/closures/confirm`）在同一
+  原子操作内核对内容与版本后重算提交，期间任何已提交变更（人群组或封闭变更、
+  场景替换或重置、时钟推进）都使凭据失效。
 - 每次变更在单个 SQLite 事务内完成“全量重排 + 落库”：并发变更不会超用容量，
   也不会留下只重排一部分组的中间状态。
 - 无法在截止分钟前（到达分钟 `> deadline`）安排的组返回原因码：
@@ -82,6 +87,8 @@ EVAC_DB_PATH=./data/evacuation.db .venv/bin/uvicorn app.main:app --host 0.0.0.0 
 | POST | `/api/groups` | 新增人群组，仅重排未出发组 |
 | DELETE | `/api/groups/{id}` | 删除未出发人群组并重排（已出发组 409） |
 | POST | `/api/closures` | 新增封闭时段；触及已出发组剩余路线则 409 整次拒绝 |
+| POST | `/api/closures/preview` | **封闭预演（不写状态）**：返回确认凭据、拟执行后完整编排与逐组变化 |
+| POST | `/api/closures/confirm` | **凭据确认**：同版本原子重算并提交，版本不符则 409 拒绝 |
 | DELETE | `/api/closures/{id}` | 删除封闭时段并重排未出发组 |
 | POST | `/api/clock/advance` | 时钟向前推进 N 分钟 |
 | POST | `/api/reset` | 恢复内置演示场景 |
@@ -134,6 +141,76 @@ EVAC_DB_PATH=./data/evacuation.db .venv/bin/uvicorn app.main:app --host 0.0.0.0 
 返回 `400 {"error":"bad_request",...}`；封闭触及已出发组或删除已出发组等
 结构性冲突返回 `409 {"error":"planning_conflict",...}`。
 
+### 封闭预演与凭据确认（两阶段提交）
+
+值班员封闭通道前先预演对疏散计划的影响：
+
+1. `POST /api/closures/preview`：请求体与 `POST /api/closures` **完全相同**
+   （单个 `closure` 对象或对象数组；沿用既有字段与左闭右开规则）。服务**只读、
+   绝不写入状态**，在内存副本上按既有优先级、容量、固定路线规则全量重排，返回：
+   - `credential`：确认凭据，内含随机 `token`、绑定的 `state_version`，
+     以及该批次预分配编号后的完整封闭内容（`id/edge_id/start_minute/end_minute`）；
+   - `plan`：拟执行后的**完整编排**，结构与 `GET /api/plan` 一致；
+   - `changes`：**逐组**对比现状，给出 `current` / `projected` 两组要点，
+     以及仅包含实际变化字段的 `changes`（`status`、`route`、`departure_minute`、
+     `arrival_minute`、`reason` 五项中的任一项；无变化时 `changed=false`）。
+2. 若该批封闭与任一**已出发组的剩余占用**相交，预演直接返回
+   `409 {"error":"planning_conflict",...}`，**不生成确认凭据**（数组批次中一条
+   冲突即整次拒绝）。引用不存在通道 / 编号冲突仍为 `400`，结构错误仍为 `422`。
+3. `POST /api/closures/confirm`，请求体 `{"token": "..."}`：在**同一原子操作**
+   （进程锁 + 单个 SQLite 事务）内核对凭据绑定的封闭内容与状态版本，通过后
+   重算并提交；成功响应与 `POST /api/closures` 相同（即拟执行后的完整编排）。
+
+凭据失效规则（乐观并发）：系统维护单调递增的**状态版本**，任何已提交变更
+——人群组新增/删除、封闭新增/删除、场景替换、`/api/reset`、时钟推进——
+都会使版本 +1。确认时若版本与凭据不一致，返回
+`409 {"error":"credential_invalid",...}` 且**不写入任何数据**，需重新预演；
+凭据为一次性（确认成功即作废），重复或未知凭据返回
+`404 {"error":"credential_not_found",...}`。预演凭据仅保存在服务进程内存中，
+服务重启后旧凭据同样以 `404` 失效（状态本身在 SQLite 中持久化，不受影响）。
+
+```jsonc
+// POST /api/closures/preview 响应示例（节选）
+{
+  "now": 1,
+  "state_version": 5,
+  "credential": {
+    "token": "btnX4zAVR3VC...",
+    "state_version": 5,
+    "closures": [
+      {"id": 3, "edge_id": 1, "start_minute": 2, "end_minute": 8}
+    ]
+  },
+  "plan": { "now": 1, "groups": [ /* 与 GET /api/plan 同构 */ ] },
+  "changes": [
+    {
+      "id": 4, "departed": false, "changed": true,
+      "current":   {"status": "scheduled", "route": [2], "departure_minute": 1,
+                    "arrival_minute": 5, "reason": null},
+      "projected": {"status": "scheduled", "route": [2], "departure_minute": 8,
+                    "arrival_minute": 12, "reason": null},
+      "changes": {
+        "departure_minute": {"before": 1, "after": 8},
+        "arrival_minute":   {"before": 5, "after": 12}
+      }
+    }
+  ]
+}
+```
+
+```bash
+# 预演 -> 检查变化 -> 确认（jq 提取 token；无 jq 时见 examples 中的纯 curl 写法）
+TOKEN=$(curl -sS -X POST http://127.0.0.1:8000/api/closures/preview \
+  -H 'Content-Type: application/json' \
+  -d '{"edge_id": 1, "start_minute": 2, "end_minute": 8}' \
+  | tee /tmp/preview.json | python3 -c 'import sys,json;print(json.load(sys.stdin)["credential"]["token"])')
+curl -sS -X POST http://127.0.0.1:8000/api/closures/confirm \
+  -H 'Content-Type: application/json' -d "{\"token\": \"$TOKEN\"}"
+```
+
+`GET /api/plan` 与 `POST /api/closures` 的请求、响应与错误语义保持不变；
+预演接口不改变任何状态（含状态版本），可安全重复调用。
+
 ## 四、调用示例
 
 ```bash
@@ -172,7 +249,9 @@ python3 examples/call_api.py http://127.0.0.1:8000
 
 测试覆盖：最短路径与封闭推迟、左闭右开边界、每分钟容量错峰（含跨多分钟通道）、
 优先级/同级排序、出口与通道序列平局裁决、时钟推进后已出发组固定、
-封闭触及剩余路线的冲突检测、批量变更原子性，以及 10 并发新增组不超卖容量。
+封闭触及剩余路线的冲突检测、批量变更原子性，以及 10 并发新增组不超卖容量；
+另覆盖封闭预演不写状态、逐组变化对比、预演冲突 409 不发凭据、凭据一次性、
+以及人群组/封闭增删、场景替换/重置、时钟推进等各类变更后凭据失效拒绝确认。
 
 ## 七、目录结构
 
@@ -182,7 +261,7 @@ app/
   schemas.py    Pydantic 入参模型
   models.py     领域数据模型
   planner.py    编排核心（路径枚举、禁入区间合并、逐组贪心、全量重排）
-  service.py    事务与并发锁、原子变更编排
+  service.py    事务与并发锁、原子变更编排、封闭预演凭据与确认
   database.py   SQLite 建表与读写
   seed.py       内置演示场景
 examples/       curl 与 Python 调用示例
